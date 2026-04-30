@@ -3,6 +3,8 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -11,6 +13,7 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static('uploads'));
 
 // Supabase client
 const supabase = createClient(
@@ -20,6 +23,15 @@ const supabase = createClient(
 
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this';
+
+// File upload setup
+const storage = multer.diskStorage({
+    destination: './uploads/',
+    filename: (req, file, cb) => {
+        cb(null, Date.now() + path.extname(file.originalname));
+    }
+});
+const upload = multer({ storage });
 
 // Auth middleware
 const authenticateToken = (req, res, next) => {
@@ -46,11 +58,6 @@ const requireAdmin = async (req, res, next) => {
     next();
 };
 
-// Helper functions
-function generateOrderNumber() {
-    return 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6).toUpperCase();
-}
-
 // Auth Routes
 app.post('/api/auth/register', async (req, res) => {
     const { email, password, full_name } = req.body;
@@ -67,10 +74,7 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(400).json({ error: 'User already exists' });
         }
 
-        // Hash password
-        const hashedPassword = await bcrypt.hash(password, 10);
-
-        // Create user in Supabase Auth with custom approach
+        // Create user in Supabase Auth
         const { data: authData, error: authError } = await supabase.auth.signUp({
             email,
             password,
@@ -101,7 +105,6 @@ app.post('/api/auth/register', async (req, res) => {
 
         res.json({ token, user: profile });
     } catch (error) {
-        console.error('Registration error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -117,13 +120,11 @@ app.post('/api/auth/login', async (req, res) => {
 
         if (authError) throw authError;
 
-        const { data: profile, error: profileError } = await supabase
+        const { data: profile } = await supabase
             .from('profiles')
             .select('*')
             .eq('id', authData.user.id)
             .single();
-
-        if (profileError) throw profileError;
 
         const token = jwt.sign(
             { id: profile.id, email: profile.email, role: profile.role },
@@ -133,32 +134,18 @@ app.post('/api/auth/login', async (req, res) => {
 
         res.json({ token, user: profile });
     } catch (error) {
-        console.error('Login error:', error);
         res.status(401).json({ error: 'Invalid credentials' });
     }
-});
-
-// Categories Routes
-app.get('/api/categories', async (req, res) => {
-    const { data, error } = await supabase
-        .from('categories')
-        .select('*')
-        .order('name');
-
-    if (error) {
-        return res.status(500).json({ error: error.message });
-    }
-    res.json(data);
 });
 
 // Products Routes
 app.get('/api/products', async (req, res) => {
     const { category, search, vegan, gluten_free, min_price, max_price } = req.query;
     
-    let query = supabase.from('products').select('*');
+    let query = supabase.from('products').select('*, categories(name, slug)');
 
     if (category && category !== 'all') {
-        query = query.eq('category_id', category);
+        query = query.eq('categories.slug', category);
     }
     if (search) {
         query = query.ilike('name', `%${search}%`);
@@ -187,7 +174,7 @@ app.get('/api/products', async (req, res) => {
 app.get('/api/products/:id', async (req, res) => {
     const { data, error } = await supabase
         .from('products')
-        .select('*')
+        .select('*, categories(name, slug)')
         .eq('id', req.params.id)
         .single();
 
@@ -197,14 +184,38 @@ app.get('/api/products/:id', async (req, res) => {
     res.json(data);
 });
 
-app.post('/api/products', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/products', authenticateToken, requireAdmin, upload.single('image'), async (req, res) => {
     try {
+        let image_url = req.body.image_url;
+        
+        if (req.file) {
+            // Upload to Supabase Storage
+            const file = req.file;
+            const fileName = `${Date.now()}-${file.originalname}`;
+            const { data: uploadData, error: uploadError } = await supabase.storage
+                .from('product-images')
+                .upload(fileName, file.buffer, {
+                    contentType: file.mimetype
+                });
+            
+            if (uploadError) throw uploadError;
+            
+            const { data: { publicUrl } } = supabase.storage
+                .from('product-images')
+                .getPublicUrl(fileName);
+            
+            image_url = publicUrl;
+        }
+        
         const productData = {
             ...req.body,
+            image_url,
             price: parseFloat(req.body.price),
             stock_quantity: parseInt(req.body.stock_quantity),
             is_vegan: req.body.is_vegan === 'true',
-            is_gluten_free: req.body.is_gluten_free === 'true'
+            is_gluten_free: req.body.is_gluten_free === 'true',
+            size_variants: req.body.size_variants ? JSON.parse(req.body.size_variants) : null,
+            nutritional_info: req.body.nutritional_info ? JSON.parse(req.body.nutritional_info) : null
         };
         
         const { data, error } = await supabase
@@ -246,7 +257,7 @@ app.delete('/api/products/:id', authenticateToken, requireAdmin, async (req, res
     res.json({ message: 'Product deleted successfully' });
 });
 
-// Cart Sync Routes
+// Cart Routes (using localStorage on frontend, but we'll sync)
 app.get('/api/cart/sync', authenticateToken, async (req, res) => {
     const { data: cartItems, error } = await supabase
         .from('cart_items')
@@ -288,9 +299,9 @@ app.post('/api/cart/sync', authenticateToken, async (req, res) => {
 app.post('/api/orders', authenticateToken, async (req, res) => {
     const { items, shipping_address, shipping_city, shipping_postal_code, total_amount } = req.body;
     
-    const order_number = generateOrderNumber();
+    const order_number = 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6);
     
-    // Create order
+    // Start a transaction
     const { data: order, error: orderError } = await supabase
         .from('orders')
         .insert([{
@@ -337,12 +348,10 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
             .eq('id', item.id)
             .single();
         
-        if (product) {
-            await supabase
-                .from('products')
-                .update({ stock_quantity: Math.max(0, product.stock_quantity - item.quantity) })
-                .eq('id', item.id);
-        }
+        await supabase
+            .from('products')
+            .update({ stock_quantity: product.stock_quantity - item.quantity })
+            .eq('id', item.id);
     }
     
     // Clear cart after order
@@ -402,30 +411,6 @@ app.get('/api/products/:productId/reviews', async (req, res) => {
 app.post('/api/products/:productId/reviews', authenticateToken, async (req, res) => {
     const { rating, comment } = req.body;
     
-    // Check if user already reviewed
-    const { data: existing } = await supabase
-        .from('reviews')
-        .select('id')
-        .eq('product_id', req.params.productId)
-        .eq('user_id', req.user.id)
-        .single();
-    
-    if (existing) {
-        // Update existing review
-        const { data, error } = await supabase
-            .from('reviews')
-            .update({ rating, comment, updated_at: new Date() })
-            .eq('id', existing.id)
-            .select()
-            .single();
-        
-        if (error) {
-            return res.status(500).json({ error: error.message });
-        }
-        return res.json(data);
-    }
-    
-    // Create new review
     const { data, error } = await supabase
         .from('reviews')
         .insert([{
@@ -493,9 +478,9 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
         .from('orders')
         .select('total_amount, status');
     
-    const { count: totalUsers } = await supabase
+    const { data: users } = await supabase
         .from('profiles')
-        .select('*', { count: 'exact', head: true });
+        .select('id', { count: 'exact' });
     
     const total_sales = orders?.reduce((sum, order) => sum + (order.status !== 'cancelled' ? order.total_amount : 0), 0) || 0;
     const pending_orders = orders?.filter(order => order.status === 'pending').length || 0;
@@ -503,7 +488,7 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
     res.json({
         total_sales,
         total_orders: orders?.length || 0,
-        total_users: totalUsers || 0,
+        total_users: users?.length || 0,
         pending_orders
     });
 });
@@ -550,16 +535,6 @@ app.put('/api/profile', authenticateToken, async (req, res) => {
     res.json(data);
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
-
-// For Vercel serverless deployment
-if (process.env.NODE_ENV !== 'production') {
-    app.listen(PORT, () => {
-        console.log(`Server running on port ${PORT}`);
-    });
-}
-
-module.exports = app;
