@@ -138,6 +138,143 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// Add this after your existing auth routes
+
+// Admin login with special handling
+app.post('/api/auth/admin-login', async (req, res) => {
+    const { email, password } = req.body;
+
+    try {
+        // First, try to authenticate with Supabase Auth
+        const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+            email,
+            password,
+        });
+
+        if (authError) {
+            console.error('Auth error:', authError);
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        // Get user profile
+        const { data: profile, error: profileError } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', authData.user.id)
+            .single();
+
+        if (profileError) {
+            console.error('Profile error:', profileError);
+            return res.status(401).json({ error: 'User profile not found' });
+        }
+
+        // Check if user is admin
+        if (profile.role !== 'admin') {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+
+        // Generate new JWT with updated role
+        const token = jwt.sign(
+            { id: profile.id, email: profile.email, role: profile.role },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        res.json({ 
+            token, 
+            user: profile,
+            message: 'Admin login successful'
+        });
+    } catch (error) {
+        console.error('Admin login error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Refresh user token (to get updated role)
+app.post('/api/auth/refresh-token', authenticateToken, async (req, res) => {
+    try {
+        // Get fresh user data from database
+        const { data: profile, error } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', req.user.id)
+            .single();
+
+        if (error) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Generate new token with updated role
+        const newToken = jwt.sign(
+            { id: profile.id, email: profile.email, role: profile.role },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        res.json({ 
+            token: newToken, 
+            user: profile 
+        });
+    } catch (error) {
+        console.error('Token refresh error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Direct role update for admin (use with caution)
+app.put('/api/admin/update-role/:userId', authenticateToken, requireAdmin, async (req, res) => {
+    const { userId } = req.params;
+    const { role } = req.body;
+
+    if (!['user', 'admin'].includes(role)) {
+        return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    try {
+        const { data, error } = await supabase
+            .from('profiles')
+            .update({ role, updated_at: new Date() })
+            .eq('id', userId)
+            .select()
+            .single();
+
+        if (error) {
+            return res.status(500).json({ error: error.message });
+        }
+
+        res.json({ message: 'Role updated successfully', user: data });
+    } catch (error) {
+        console.error('Role update error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Debug endpoint to check user role (for troubleshooting)
+app.get('/api/debug/user-role', authenticateToken, async (req, res) => {
+    try {
+        const { data: profile, error } = await supabase
+            .from('profiles')
+            .select('id, email, role')
+            .eq('id', req.user.id)
+            .single();
+
+        if (error) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.json({
+            user_id: profile.id,
+            email: profile.email,
+            role: profile.role,
+            token_role: req.user.role
+        });
+    } catch (error) {
+        console.error('Debug error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Categories Routes
 app.get('/api/categories', async (req, res) => {
     const { data, error } = await supabase
