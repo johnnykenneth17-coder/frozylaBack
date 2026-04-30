@@ -1,476 +1,540 @@
-require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
-const path = require("path");
-const { createClient } = require("@supabase/supabase-js");
+const express = require('express');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
+require('dotenv').config();
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "../public")));
+app.use('/uploads', express.static('uploads'));
 
+// Supabase client
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY
 );
 
-// Helper: verify JWT and get user
-async function getUser(req) {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return null;
-  const {
-    data: { user },
-    error,
-  } = await supabase.auth.getUser(token);
-  if (error) return null;
-  return user;
-}
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this';
 
-// Helper: admin check
-async function isAdmin(req) {
-  const user = await getUser(req);
-  if (!user) return false;
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("role")
-    .eq("id", user.id)
-    .single();
-  return profile?.role === "admin";
-}
-
-// ---------- PUBLIC ENDPOINTS ----------
-app.get("/api/products", async (req, res) => {
-  let query = supabase.from("products").select("*, categories(name)");
-  const { category, search, minPrice, maxPrice } = req.query;
-  if (category) query = query.eq("category_id", category);
-  if (search) query = query.ilike("name", `%${search}%`);
-  if (minPrice) query = query.gte("price", parseFloat(minPrice));
-  if (maxPrice) query = query.lte("price", parseFloat(maxPrice));
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error });
-  res.json(data);
+// File upload setup
+const storage = multer.diskStorage({
+    destination: './uploads/',
+    filename: (req, file, cb) => {
+        cb(null, Date.now() + path.extname(file.originalname));
+    }
 });
+const upload = multer({ storage });
 
-app.get("/api/categories", async (req, res) => {
-  const { data, error } = await supabase
-    .from("categories")
-    .select("*")
-    .order("sort_order");
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
+// Auth middleware
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
-app.get("/api/coupons/:code", async (req, res) => {
-  const { code } = req.params;
-  const { data, error } = await supabase
-    .from("coupons")
-    .select("*")
-    .eq("code", code)
-    .eq("is_active", true)
-    .single();
-  if (error || !data) return res.status(404).json({ error: "Invalid coupon" });
-  res.json(data);
-});
+    if (!token) {
+        return res.status(401).json({ error: 'Access token required' });
+    }
 
-// Guest checkout
-
-
-app.post("/api/orders/guest", async (req, res) => {
-  const {
-    guest_email,
-    guest_name,
-    guest_phone,
-    items,
-    delivery_address,
-    payment_method,
-    total,
-    subtotal,
-    tax,
-    delivery_fee,
-    coupon_code,
-    special_instructions,
-  } = req.body;
-  const { data: order, error } = await supabase
-    .from("orders")
-    .insert({
-      guest_email,
-      guest_name,
-      guest_phone,
-      status: "pending",
-      payment_method,
-      subtotal,
-      delivery_fee,
-      tax,
-      total,
-      coupon_code,
-      special_instructions,
-      delivery_address_snapshot: delivery_address,
-      order_type: "delivery",
-    })
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  const orderItems = items.map((item) => ({
-    order_id: order.id,
-    product_id: item.product_id,
-    product_name: item.name,
-    product_price: item.price,
-    quantity: item.quantity,
-    customizations: item.customizations || {},
-  }));
-  const { error: itemsError } = await supabase
-    .from("order_items")
-    .insert(orderItems);
-  if (itemsError) return res.status(500).json({ error: itemsError.message });
-  res.json({ order_id: order.id, status: order.status });
-});
-
-// Order tracking (public)
-app.get("/api/orders/:id", async (req, res) => {
-  const { id } = req.params;
-  const { data, error } = await supabase
-    .from("orders")
-    .select("*, order_items(*)")
-    .eq("id", id)
-    .single();
-  if (error) return res.status(404).json({ error: "Order not found" });
-  res.json(data);
-});
-
-// ---------- AUTHENTICATED USER ENDPOINTS ----------
-app.use(async (req, res, next) => {
-  const user = await getUser(req);
-  if (!user && !req.path.startsWith("/api/admin"))
-    return res.status(401).json({ error: "Unauthorized" });
-  req.user = user;
-  next();
-});
-
-// Cart
-app.get("/api/cart", async (req, res) => {
-  const { data, error } = await supabase
-    .from("cart_items")
-    .select("*, products(*)")
-    .eq("user_id", req.user.id);
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.post("/api/cart", async (req, res) => {
-  const { product_id, quantity, custom_instructions } = req.body;
-  const { data, error } = await supabase
-    .from("cart_items")
-    .upsert(
-      { user_id: req.user.id, product_id, quantity, custom_instructions },
-      { onConflict: "user_id,product_id" },
-    )
-    .select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
-});
-
-app.delete("/api/cart/:product_id", async (req, res) => {
-  const { product_id } = req.params;
-  const { error } = await supabase
-    .from("cart_items")
-    .delete()
-    .eq("user_id", req.user.id)
-    .eq("product_id", product_id);
-  if (error) return res.status(500).json({ error });
-  res.json({ success: true });
-});
-
-// Addresses
-app.get("/api/addresses", async (req, res) => {
-  const { data, error } = await supabase
-    .from("addresses")
-    .select("*")
-    .eq("user_id", req.user.id);
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.post("/api/addresses", async (req, res) => {
-  const { data, error } = await supabase
-    .from("addresses")
-    .insert({ ...req.body, user_id: req.user.id })
-    .select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
-});
-
-app.put("/api/addresses/:id", async (req, res) => {
-  const { id } = req.params;
-  const { data, error } = await supabase
-    .from("addresses")
-    .update(req.body)
-    .eq("id", id)
-    .eq("user_id", req.user.id)
-    .select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
-});
-
-app.delete("/api/addresses/:id", async (req, res) => {
-  const { id } = req.params;
-  const { error } = await supabase
-    .from("addresses")
-    .delete()
-    .eq("id", id)
-    .eq("user_id", req.user.id);
-  if (error) return res.status(500).json({ error });
-  res.json({ success: true });
-});
-
-// Orders (user)
-app.get("/api/my-orders", async (req, res) => {
-  const { data, error } = await supabase
-    .from("orders")
-    .select("*, order_items(*)")
-    .eq("user_id", req.user.id)
-    .order("created_at", { ascending: false });
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.post("/api/orders", async (req, res) => {
-  const {
-    items,
-    delivery_address_id,
-    payment_method,
-    total,
-    subtotal,
-    tax,
-    delivery_fee,
-    coupon_code,
-    special_instructions,
-    scheduled_time,
-  } = req.body;
-  let addressSnapshot = null;
-  if (delivery_address_id) {
-    const { data: addr } = await supabase
-      .from("addresses")
-      .select("*")
-      .eq("id", delivery_address_id)
-      .single();
-    addressSnapshot = addr;
-  }
-  const { data: order, error } = await supabase
-    .from("orders")
-    .insert({
-      user_id: req.user.id,
-      status: "pending",
-      payment_method,
-      subtotal,
-      delivery_fee,
-      tax,
-      total,
-      coupon_code,
-      special_instructions,
-      scheduled_time,
-      delivery_address_id,
-      delivery_address_snapshot: addressSnapshot,
-      order_type: "delivery",
-    })
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error });
-  const orderItems = items.map((item) => ({
-    order_id: order.id,
-    product_id: item.product_id,
-    product_name: item.name,
-    product_price: item.price,
-    quantity: item.quantity,
-    customizations: item.customizations || {},
-  }));
-  const { error: itemsError } = await supabase
-    .from("order_items")
-    .insert(orderItems);
-  if (itemsError) return res.status(500).json({ error: itemsError.message });
-  // Clear cart
-  await supabase.from("cart_items").delete().eq("user_id", req.user.id);
-  res.json({ order_id: order.id, status: order.status });
-});
-
-// Reviews
-app.get("/api/products/:productId/reviews", async (req, res) => {
-  const { productId } = req.params;
-  const { data, error } = await supabase
-    .from("reviews")
-    .select("*, profiles(full_name, avatar_url)")
-    .eq("product_id", productId);
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.post("/api/reviews", async (req, res) => {
-  const { product_id, order_id, rating, comment, images } = req.body;
-  const { data, error } = await supabase
-    .from("reviews")
-    .insert({
-      user_id: req.user.id,
-      product_id,
-      order_id,
-      rating,
-      comment,
-      images,
-    })
-    .select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
-});
-
-// Profile
-app.get("/api/profile", async (req, res) => {
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("*")
-    .eq("id", req.user.id)
-    .single();
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.put("/api/profile", async (req, res) => {
-  const { full_name, phone, dietary_prefs, avatar_url } = req.body;
-  const { data, error } = await supabase
-    .from("profiles")
-    .update({ full_name, phone, dietary_prefs, avatar_url })
-    .eq("id", req.user.id)
-    .select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
-});
-
-// ---------- ADMIN ONLY ENDPOINTS ----------
-app.use("/api/admin", async (req, res, next) => {
-  if (!(await isAdmin(req)))
-    return res.status(403).json({ error: "Admin access required" });
-  next();
-});
-
-app.get("/api/admin/stats", async (req, res) => {
-  const { data: orders } = await supabase
-    .from("orders")
-    .select("total, status, created_at");
-  const { data: products } = await supabase.from("products").select("stock");
-  const { count: usersCount } = await supabase
-    .from("profiles")
-    .select("*", { count: "exact", head: true });
-  const totalRevenue =
-    orders
-      ?.filter((o) => o.status === "delivered")
-      .reduce((s, o) => s + o.total, 0) || 0;
-  const totalOrders = orders?.length || 0;
-  const lowStock = products?.filter((p) => p.stock < 5).length || 0;
-  res.json({ totalRevenue, totalOrders, usersCount, lowStock });
-});
-
-app.get("/api/admin/orders", async (req, res) => {
-  const { data, error } = await supabase
-    .from("orders")
-    .select("*, order_items(*)")
-    .order("created_at", { ascending: false });
-  if (error) return res.status(500).json({ error });
-  res.json(data);
-});
-
-app.patch("/api/admin/orders/:id/status", async (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
-  const { data, error } = await supabase
-    .from("orders")
-    .update({ status, updated_at: new Date() })
-    .eq("id", id)
-    .select();
-  if (error) return res.status(500).json({ error });
-  if (data[0]?.user_id) {
-    await supabase.from("notifications").insert({
-      user_id: data[0].user_id,
-      title: "Order status updated",
-      message: `Your order #${id.slice(0, 8)} is now ${status}`,
-      type: "order_update",
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            return res.status(403).json({ error: 'Invalid or expired token' });
+        }
+        req.user = user;
+        next();
     });
-  }
-  res.json(data[0]);
+};
+
+const requireAdmin = async (req, res, next) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required' });
+    }
+    next();
+};
+
+// Auth Routes
+app.post('/api/auth/register', async (req, res) => {
+    const { email, password, full_name } = req.body;
+
+    try {
+        // Check if user exists
+        const { data: existingUser } = await supabase
+            .from('profiles')
+            .select('email')
+            .eq('email', email)
+            .single();
+
+        if (existingUser) {
+            return res.status(400).json({ error: 'User already exists' });
+        }
+
+        // Create user in Supabase Auth
+        const { data: authData, error: authError } = await supabase.auth.signUp({
+            email,
+            password,
+        });
+
+        if (authError) throw authError;
+
+        // Create profile
+        const { data: profile, error: profileError } = await supabase
+            .from('profiles')
+            .insert([{
+                id: authData.user.id,
+                email,
+                full_name,
+                role: 'user'
+            }])
+            .select()
+            .single();
+
+        if (profileError) throw profileError;
+
+        // Generate JWT
+        const token = jwt.sign(
+            { id: profile.id, email: profile.email, role: profile.role },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        res.json({ token, user: profile });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
-// Products CRUD
-app.get("/api/admin/products", async (req, res) => {
-  const { data, error } = await supabase.from("products").select("*");
-  if (error) return res.status(500).json({ error });
-  res.json(data);
+app.post('/api/auth/login', async (req, res) => {
+    const { email, password } = req.body;
+
+    try {
+        const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+            email,
+            password,
+        });
+
+        if (authError) throw authError;
+
+        const { data: profile } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', authData.user.id)
+            .single();
+
+        const token = jwt.sign(
+            { id: profile.id, email: profile.email, role: profile.role },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        res.json({ token, user: profile });
+    } catch (error) {
+        res.status(401).json({ error: 'Invalid credentials' });
+    }
 });
 
-app.post("/api/admin/products", async (req, res) => {
-  const { data, error } = await supabase
-    .from("products")
-    .insert(req.body)
-    .select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
+// Products Routes
+app.get('/api/products', async (req, res) => {
+    const { category, search, vegan, gluten_free, min_price, max_price } = req.query;
+    
+    let query = supabase.from('products').select('*, categories(name, slug)');
+
+    if (category && category !== 'all') {
+        query = query.eq('categories.slug', category);
+    }
+    if (search) {
+        query = query.ilike('name', `%${search}%`);
+    }
+    if (vegan === 'true') {
+        query = query.eq('is_vegan', true);
+    }
+    if (gluten_free === 'true') {
+        query = query.eq('is_gluten_free', true);
+    }
+    if (min_price) {
+        query = query.gte('price', parseFloat(min_price));
+    }
+    if (max_price) {
+        query = query.lte('price', parseFloat(max_price));
+    }
+
+    const { data, error } = await query;
+    
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
 });
 
-app.put("/api/admin/products/:id", async (req, res) => {
-  const { id } = req.params;
-  const { data, error } = await supabase
-    .from("products")
-    .update(req.body)
-    .eq("id", id)
-    .select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
+app.get('/api/products/:id', async (req, res) => {
+    const { data, error } = await supabase
+        .from('products')
+        .select('*, categories(name, slug)')
+        .eq('id', req.params.id)
+        .single();
+
+    if (error) {
+        return res.status(404).json({ error: 'Product not found' });
+    }
+    res.json(data);
 });
 
-app.delete("/api/admin/products/:id", async (req, res) => {
-  const { id } = req.params;
-  const { error } = await supabase.from("products").delete().eq("id", id);
-  if (error) return res.status(500).json({ error });
-  res.json({ success: true });
+app.post('/api/products', authenticateToken, requireAdmin, upload.single('image'), async (req, res) => {
+    try {
+        let image_url = req.body.image_url;
+        
+        if (req.file) {
+            // Upload to Supabase Storage
+            const file = req.file;
+            const fileName = `${Date.now()}-${file.originalname}`;
+            const { data: uploadData, error: uploadError } = await supabase.storage
+                .from('product-images')
+                .upload(fileName, file.buffer, {
+                    contentType: file.mimetype
+                });
+            
+            if (uploadError) throw uploadError;
+            
+            const { data: { publicUrl } } = supabase.storage
+                .from('product-images')
+                .getPublicUrl(fileName);
+            
+            image_url = publicUrl;
+        }
+        
+        const productData = {
+            ...req.body,
+            image_url,
+            price: parseFloat(req.body.price),
+            stock_quantity: parseInt(req.body.stock_quantity),
+            is_vegan: req.body.is_vegan === 'true',
+            is_gluten_free: req.body.is_gluten_free === 'true',
+            size_variants: req.body.size_variants ? JSON.parse(req.body.size_variants) : null,
+            nutritional_info: req.body.nutritional_info ? JSON.parse(req.body.nutritional_info) : null
+        };
+        
+        const { data, error } = await supabase
+            .from('products')
+            .insert([productData])
+            .select()
+            .single();
+        
+        if (error) throw error;
+        res.json(data);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
-// Users list (admin)
-app.get("/api/admin/users", async (req, res) => {
-  const { data, error } = await supabase.from("profiles").select("*");
-  if (error) return res.status(500).json({ error });
-  res.json(data);
+app.put('/api/products/:id', authenticateToken, requireAdmin, async (req, res) => {
+    const { data, error } = await supabase
+        .from('products')
+        .update(req.body)
+        .eq('id', req.params.id)
+        .select()
+        .single();
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () =>
-  console.log(`✅ Frozyla backend running on port ${PORT}`),
-);
+app.delete('/api/products/:id', authenticateToken, requireAdmin, async (req, res) => {
+    const { error } = await supabase
+        .from('products')
+        .delete()
+        .eq('id', req.params.id);
 
-
-// ---------- Admin Coupon CRUD ----------
-app.get('/api/admin/coupons', async (req, res) => {
-  const { data, error } = await supabase.from('coupons').select('*').order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error });
-  res.json(data);
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json({ message: 'Product deleted successfully' });
 });
 
-app.post('/api/admin/coupons', async (req, res) => {
-  const { data, error } = await supabase.from('coupons').insert(req.body).select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
+// Cart Routes (using localStorage on frontend, but we'll sync)
+app.get('/api/cart/sync', authenticateToken, async (req, res) => {
+    const { data: cartItems, error } = await supabase
+        .from('cart_items')
+        .select('*, products(*)')
+        .eq('user_id', req.user.id);
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(cartItems);
 });
 
-app.put('/api/admin/coupons/:id', async (req, res) => {
-  const { id } = req.params;
-  const { data, error } = await supabase.from('coupons').update(req.body).eq('id', id).select();
-  if (error) return res.status(500).json({ error });
-  res.json(data[0]);
+app.post('/api/cart/sync', authenticateToken, async (req, res) => {
+    const { items } = req.body;
+    
+    // Clear existing cart
+    await supabase.from('cart_items').delete().eq('user_id', req.user.id);
+    
+    // Insert new items
+    const cartItems = items.map(item => ({
+        user_id: req.user.id,
+        product_id: item.id,
+        quantity: item.quantity,
+        size_variant: item.size_variant
+    }));
+    
+    const { data, error } = await supabase
+        .from('cart_items')
+        .insert(cartItems)
+        .select();
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
 });
 
-app.delete('/api/admin/coupons/:id', async (req, res) => {
-  const { id } = req.params;
-  const { error } = await supabase.from('coupons').delete().eq('id', id);
-  if (error) return res.status(500).json({ error });
-  res.json({ success: true });
+// Orders Routes
+app.post('/api/orders', authenticateToken, async (req, res) => {
+    const { items, shipping_address, shipping_city, shipping_postal_code, total_amount } = req.body;
+    
+    const order_number = 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6);
+    
+    // Start a transaction
+    const { data: order, error: orderError } = await supabase
+        .from('orders')
+        .insert([{
+            user_id: req.user.id,
+            order_number,
+            status: 'pending',
+            total_amount,
+            shipping_address,
+            shipping_city,
+            shipping_postal_code,
+            payment_method: 'simulated',
+            payment_status: 'paid'
+        }])
+        .select()
+        .single();
+
+    if (orderError) {
+        return res.status(500).json({ error: orderError.message });
+    }
+    
+    // Insert order items
+    const orderItems = items.map(item => ({
+        order_id: order.id,
+        product_id: item.id,
+        product_name: item.name,
+        quantity: item.quantity,
+        price_at_time: item.price,
+        size_variant: item.size_variant
+    }));
+    
+    const { error: itemsError } = await supabase
+        .from('order_items')
+        .insert(orderItems);
+
+    if (itemsError) {
+        return res.status(500).json({ error: itemsError.message });
+    }
+    
+    // Update product stock
+    for (const item of items) {
+        const { data: product } = await supabase
+            .from('products')
+            .select('stock_quantity')
+            .eq('id', item.id)
+            .single();
+        
+        await supabase
+            .from('products')
+            .update({ stock_quantity: product.stock_quantity - item.quantity })
+            .eq('id', item.id);
+    }
+    
+    // Clear cart after order
+    await supabase.from('cart_items').delete().eq('user_id', req.user.id);
+    
+    res.json(order);
 });
 
-// ---------- Delivery partners (simple) ----------
-app.get('/api/admin/delivery-partners', async (req, res) => {
-  // For demo, return mock data; you can create a 'delivery_partners' table
-  res.json([{ id: 1, name: 'John Doe', phone: '+123456789', zone: 'North', status: 'active' }]);
+app.get('/api/orders', authenticateToken, async (req, res) => {
+    let query = supabase
+        .from('orders')
+        .select('*, order_items(*)')
+        .order('created_at', { ascending: false });
+    
+    if (req.user.role !== 'admin') {
+        query = query.eq('user_id', req.user.id);
+    }
+    
+    const { data, error } = await query;
+    
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+app.put('/api/orders/:id/status', authenticateToken, requireAdmin, async (req, res) => {
+    const { status } = req.body;
+    
+    const { data, error } = await supabase
+        .from('orders')
+        .update({ status, updated_at: new Date() })
+        .eq('id', req.params.id)
+        .select()
+        .single();
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+// Reviews Routes
+app.get('/api/products/:productId/reviews', async (req, res) => {
+    const { data, error } = await supabase
+        .from('reviews')
+        .select('*, profiles(full_name)')
+        .eq('product_id', req.params.productId)
+        .order('created_at', { ascending: false });
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+app.post('/api/products/:productId/reviews', authenticateToken, async (req, res) => {
+    const { rating, comment } = req.body;
+    
+    const { data, error } = await supabase
+        .from('reviews')
+        .insert([{
+            product_id: req.params.productId,
+            user_id: req.user.id,
+            rating,
+            comment
+        }])
+        .select()
+        .single();
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+// Wishlist Routes
+app.get('/api/wishlist', authenticateToken, async (req, res) => {
+    const { data, error } = await supabase
+        .from('wishlist')
+        .select('*, products(*)')
+        .eq('user_id', req.user.id);
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+app.post('/api/wishlist', authenticateToken, async (req, res) => {
+    const { product_id } = req.body;
+    
+    const { data, error } = await supabase
+        .from('wishlist')
+        .insert([{
+            user_id: req.user.id,
+            product_id
+        }])
+        .select()
+        .single();
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+app.delete('/api/wishlist/:productId', authenticateToken, async (req, res) => {
+    const { error } = await supabase
+        .from('wishlist')
+        .delete()
+        .eq('user_id', req.user.id)
+        .eq('product_id', req.params.productId);
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json({ message: 'Removed from wishlist' });
+});
+
+// Admin Dashboard Routes
+app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
+    const { data: orders } = await supabase
+        .from('orders')
+        .select('total_amount, status');
+    
+    const { data: users } = await supabase
+        .from('profiles')
+        .select('id', { count: 'exact' });
+    
+    const total_sales = orders?.reduce((sum, order) => sum + (order.status !== 'cancelled' ? order.total_amount : 0), 0) || 0;
+    const pending_orders = orders?.filter(order => order.status === 'pending').length || 0;
+    
+    res.json({
+        total_sales,
+        total_orders: orders?.length || 0,
+        total_users: users?.length || 0,
+        pending_orders
+    });
+});
+
+app.get('/api/admin/orders', authenticateToken, requireAdmin, async (req, res) => {
+    const { data, error } = await supabase
+        .from('orders')
+        .select('*, order_items(*), profiles(full_name, email)')
+        .order('created_at', { ascending: false });
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+// Profile Routes
+app.get('/api/profile', authenticateToken, async (req, res) => {
+    const { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', req.user.id)
+        .single();
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+app.put('/api/profile', authenticateToken, async (req, res) => {
+    const { full_name, phone, address, city, postal_code } = req.body;
+    
+    const { data, error } = await supabase
+        .from('profiles')
+        .update({ full_name, phone, address, city, postal_code, updated_at: new Date() })
+        .eq('id', req.user.id)
+        .select()
+        .single();
+
+    if (error) {
+        return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
+});
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
